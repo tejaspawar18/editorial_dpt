@@ -2425,7 +2425,7 @@ def write_pdf_report(
     def section_divider() -> HRFlowable:
         return HRFlowable(width="100%", thickness=0.7, color=colors.HexColor("#D0D7E2"), spaceBefore=2, spaceAfter=2)
 
-    story.append(Spacer(1, 8))
+    story.append(Spacer(1, 1))
     story.append(Paragraph("Editorial and Opinion Summary", title_style))
     story.append(Paragraph(html.escape(formatted_date, quote=False), centered_date_style))
     story.append(Spacer(1, 5))

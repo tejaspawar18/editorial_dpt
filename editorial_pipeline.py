@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import time
 import unicodedata
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -65,6 +66,17 @@ DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 DEFAULT_S3_PREFIX = "hindu-editorials"
 GEMINI_API_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 REQUEST_TIMEOUT_SECONDS = 30
+DEFAULT_SLACK_UPLOAD_MAX_RETRIES = 4
+DEFAULT_SLACK_RETRY_BACKOFF_SECONDS = 5
+DEFAULT_SLACK_FALLBACK_LINK_EXPIRY_SECONDS = 7 * 24 * 60 * 60
+SLACK_RETRYABLE_ERRORS = {
+    "internal_error",
+    "ratelimited",
+    "request_timeout",
+    "service_unavailable",
+    "fatal_error",
+    "temporary_error",
+}
 MIN_DAILY_TAKEAWAYS = 3
 MAX_DAILY_TAKEAWAYS = 5
 SUMMARY_WORD_LIMIT = 70
@@ -241,6 +253,9 @@ class PipelineConfig:
     slack_bot_token: str
     slack_channel_id: str
     slack_webhook_url: str
+    slack_upload_max_retries: int
+    slack_retry_backoff_seconds: int
+    slack_fallback_link_expiry_seconds: int
 
 
 @dataclass
@@ -436,6 +451,20 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         slack_bot_token=os.getenv("SLACK_BOT_TOKEN", "").strip(),
         slack_channel_id=os.getenv("SLACK_CHANNEL_ID", "").strip(),
         slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL", "").strip(),
+        slack_upload_max_retries=max(1, int(os.getenv("SLACK_UPLOAD_MAX_RETRIES", str(DEFAULT_SLACK_UPLOAD_MAX_RETRIES)))),
+        slack_retry_backoff_seconds=max(
+            1,
+            int(os.getenv("SLACK_RETRY_BACKOFF_SECONDS", str(DEFAULT_SLACK_RETRY_BACKOFF_SECONDS))),
+        ),
+        slack_fallback_link_expiry_seconds=max(
+            300,
+            int(
+                os.getenv(
+                    "SLACK_FALLBACK_LINK_EXPIRY_SECONDS",
+                    str(DEFAULT_SLACK_FALLBACK_LINK_EXPIRY_SECONDS),
+                )
+            ),
+        ),
     )
 
 
@@ -2423,7 +2452,7 @@ def write_pdf_report(
     grouped_editorials = group_editorials_by_source(editorials)
 
     def section_divider() -> HRFlowable:
-        return HRFlowable(width="100%", thickness=0.7, color=colors.HexColor("#D0D7E2"), spaceBefore=2, spaceAfter=2)
+        return HRFlowable(width="100%", thickness=0.7, color=colors.HexColor("#D0D7E2"), spaceBefore=2, spaceAfter=1)
 
     story.append(Spacer(1, 1))
     story.append(Paragraph("Editorial and Opinion Summary", title_style))
@@ -2461,7 +2490,7 @@ def write_pdf_report(
                 story.append(Paragraph(f"<b>Key Takeaway:</b> {emphasized_takeaway}", body_style))
             story.append(Spacer(1, 5))
             story.append(section_divider())
-            story.append(Spacer(1, 4))
+            story.append(Spacer(1, 2))
             editorial_index += 1
 
     story.append(Spacer(1, 4))
@@ -2508,39 +2537,173 @@ def upload_artifacts_to_s3(
     }
 
 
+def build_slack_fallback_pdf_reference(config: PipelineConfig, artifact_info: dict[str, str]) -> str:
+    pdf_s3_uri = artifact_info.get("pdf_s3_uri", "").strip()
+    if not pdf_s3_uri:
+        return ""
+
+    bucket, key = parse_s3_uri(pdf_s3_uri)
+    if not bucket or not key:
+        return pdf_s3_uri
+
+    try:
+        s3 = boto3.client("s3", region_name=config.aws_region)
+        return s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=config.slack_fallback_link_expiry_seconds,
+        )
+    except Exception as exc:
+        logging.warning("Could not create presigned S3 URL for Slack fallback: %s", exc)
+        return pdf_s3_uri
+
+
+def compute_slack_retry_delay_seconds(config: PipelineConfig, attempt_number: int, error: SlackApiError | None = None) -> int:
+    if error is not None:
+        headers = getattr(error.response, "headers", {}) or {}
+        retry_after = headers.get("Retry-After") or headers.get("retry-after")
+        if retry_after:
+            try:
+                return max(config.slack_retry_backoff_seconds, int(retry_after))
+            except (TypeError, ValueError):
+                pass
+    return config.slack_retry_backoff_seconds * attempt_number
+
+
+def post_slack_fallback_message(
+    config: PipelineConfig,
+    client: WebClient | None,
+    message: str,
+) -> bool:
+    if client is not None and config.slack_channel_id:
+        try:
+            client.chat_postMessage(channel=config.slack_channel_id, text=message)
+            logging.info("Posted Slack fallback message with PDF link.")
+            return True
+        except SlackApiError as exc:
+            logging.warning(
+                "Slack fallback chat message failed (%s).",
+                exc.response.get("error", "unknown_error"),
+            )
+        except Exception as exc:
+            logging.warning("Slack fallback chat message failed: %s", exc)
+
+    if config.slack_webhook_url:
+        try:
+            response = requests.post(
+                config.slack_webhook_url,
+                json={"text": message},
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            logging.info("Posted Slack fallback message via webhook.")
+            return True
+        except Exception as exc:
+            logging.warning("Slack webhook fallback failed: %s", exc)
+
+    return False
+
+
 def post_to_slack(
     config: PipelineConfig,
     target_date: str,
     editorial_count: int,
     pdf_path: Path,
+    artifact_info: dict[str, str] | None = None,
 ) -> None:
     if editorial_count == 0:
         return
 
+    artifact_info = artifact_info or {}
+    fallback_pdf_reference = build_slack_fallback_pdf_reference(config, artifact_info)
+    summary_title = f"Editorial and Opinion Summary {target_date}"
+    initial_comment = f"Editorial and Opinion Summary ({target_date})"
+
     if config.slack_bot_token and config.slack_channel_id:
         client = WebClient(token=config.slack_bot_token)
-        try:
-            client.files_upload_v2(
-                channel=config.slack_channel_id,
-                file=str(pdf_path),
-                filename=pdf_path.name,
-                title=f"Editorial and Opinion Summary {target_date}",
-                initial_comment=f"Editorial and Opinion Summary ({target_date})",
+        joined_channel = False
+        for attempt in range(1, config.slack_upload_max_retries + 1):
+            try:
+                client.files_upload_v2(
+                    channel=config.slack_channel_id,
+                    file=str(pdf_path),
+                    filename=pdf_path.name,
+                    title=summary_title,
+                    initial_comment=initial_comment,
+                )
+                logging.info("Posted PDF file to Slack channel.")
+                return
+            except SlackApiError as exc:
+                error_code = exc.response.get("error", "unknown_error")
+                if error_code == "not_in_channel" and not joined_channel:
+                    try:
+                        client.conversations_join(channel=config.slack_channel_id)
+                        joined_channel = True
+                        logging.info("Joined Slack channel and retrying PDF upload.")
+                        continue
+                    except SlackApiError as join_exc:
+                        logging.warning(
+                            "Could not join Slack channel before retry (%s).",
+                            join_exc.response.get("error", "unknown_error"),
+                        )
+                if error_code in SLACK_RETRYABLE_ERRORS and attempt < config.slack_upload_max_retries:
+                    delay_seconds = compute_slack_retry_delay_seconds(config, attempt, exc)
+                    logging.warning(
+                        "Slack upload attempt %d/%d failed (%s). Retrying in %d seconds.",
+                        attempt,
+                        config.slack_upload_max_retries,
+                        error_code,
+                        delay_seconds,
+                    )
+                    time.sleep(delay_seconds)
+                    continue
+                logging.warning(
+                    "Slack upload failed (%s). Falling back to Slack message notification if possible.",
+                    error_code,
+                )
+                break
+            except Exception as exc:
+                if attempt < config.slack_upload_max_retries:
+                    delay_seconds = compute_slack_retry_delay_seconds(config, attempt)
+                    logging.warning(
+                        "Slack upload attempt %d/%d failed (%s). Retrying in %d seconds.",
+                        attempt,
+                        config.slack_upload_max_retries,
+                        exc,
+                        delay_seconds,
+                    )
+                    time.sleep(delay_seconds)
+                    continue
+                logging.warning("Slack upload failed after retries: %s", exc)
+                break
+
+        if fallback_pdf_reference:
+            fallback_message = (
+                f"{initial_comment}\n"
+                f"Slack file upload did not complete, so here is the PDF download link instead:\n"
+                f"{fallback_pdf_reference}"
             )
-            logging.info("Posted PDF file to Slack channel.")
-        except SlackApiError as exc:
-            error_code = exc.response.get("error", "unknown_error")
-            logging.warning(
-                "Slack upload failed (%s). Check that SLACK_CHANNEL_ID contains only the channel ID "
-                "and that the bot has access to the target channel.",
-                error_code,
+        else:
+            fallback_message = (
+                f"{initial_comment}\n"
+                "Slack file upload did not complete and no S3 fallback link is available."
             )
+        if post_slack_fallback_message(config, client, fallback_message):
+            return
+        logging.warning("Slack delivery did not succeed, and fallback notification also failed.")
         return
 
     if config.slack_webhook_url:
+        if fallback_pdf_reference:
+            fallback_message = (
+                f"{initial_comment}\n"
+                f"PDF download link:\n{fallback_pdf_reference}"
+            )
+            if post_slack_fallback_message(config, None, fallback_message):
+                return
         logging.warning(
             "SLACK_WEBHOOK_URL is configured, but webhook delivery cannot upload files. "
-            "Set SLACK_BOT_TOKEN and SLACK_CHANNEL_ID for PDF delivery."
+            "Configure S3 plus bot-token upload or S3 fallback links for reliable PDF delivery."
         )
         return
 
@@ -2623,8 +2786,8 @@ def run_pipeline(config: PipelineConfig) -> None:
         write_pdf_report(pdf_path, config.target_date, daily_takeaways, editorials)
         logging.info("Wrote daily PDF report to %s", pdf_path)
 
-        upload_artifacts_to_s3(config, config.target_date, json_path, pdf_path)
-        post_to_slack(config, config.target_date, len(editorials), pdf_path)
+        artifact_info = upload_artifacts_to_s3(config, config.target_date, json_path, pdf_path)
+        post_to_slack(config, config.target_date, len(editorials), pdf_path, artifact_info)
 
 
 def main() -> None:

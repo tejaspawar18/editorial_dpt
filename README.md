@@ -26,6 +26,12 @@ Update `.env` with:
 - Optional: `GEMINI_MODEL` (defaults to `gemini-2.5-flash`)
 - `S3_BUCKET` (+ AWS credentials in your environment/IAM role)
 - Optional S3 alternatives: `S3_BUCKET_EVENT` or `S3_URI` (example: `s3://pulse-narrative/editorials/`)
+- Slack delivery:
+  - `SLACK_BOT_TOKEN` and `SLACK_CHANNEL_ID` for direct PDF upload
+  - Optional `SLACK_WEBHOOK_URL` for fallback text/link notification
+  - Optional `SLACK_UPLOAD_MAX_RETRIES` (default `4`)
+  - Optional `SLACK_RETRY_BACKOFF_SECONDS` (default `5`)
+  - Optional `SLACK_FALLBACK_LINK_EXPIRY_SECONDS` (default `604800`)
 - Optional source overrides:
   - `HINDU_EDITORIAL_URL` to set the primary section URL
   - `HINDU_EDITORIAL_URLS` as a comma-separated override list for all opinion source pages

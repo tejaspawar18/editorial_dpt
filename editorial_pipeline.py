@@ -2351,7 +2351,6 @@ def write_pdf_report(
         fontName="Helvetica-Oblique",
         fontSize=9.3,
         leading=10,
-        alignment=TA_CENTER,
         textColor=colors.HexColor("#7A7A7A"),
     )
     section_heading_style = ParagraphStyle(

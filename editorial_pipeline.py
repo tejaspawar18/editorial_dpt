@@ -24,6 +24,7 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
 from reportlab.platypus import HRFlowable, Paragraph, SimpleDocTemplate, Spacer
 from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -269,13 +270,21 @@ def load_env_file(file_path: str = ".env") -> None:
     if not env_path.exists():
         return
 
+    def parse_env_value(raw_value: str) -> str:
+        trimmed = raw_value.strip()
+        if not trimmed:
+            return ""
+        if len(trimmed) >= 2 and trimmed[0] == trimmed[-1] and trimmed[0] in {"'", '"'}:
+            return trimmed[1:-1]
+        return re.sub(r"\s+#.*$", "", trimmed).strip()
+
     for line in env_path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or "=" not in stripped:
             continue
         key, value = stripped.split("=", 1)
         key = key.strip()
-        value = value.strip().strip("'").strip('"')
+        value = parse_env_value(value)
         if key and key not in os.environ:
             os.environ[key] = value
 
@@ -424,9 +433,9 @@ def build_config(args: argparse.Namespace) -> PipelineConfig:
         aws_region=os.getenv("AWS_REGION", "ap-south-1"),
         s3_bucket=s3_bucket,
         s3_prefix=s3_prefix,
-        slack_bot_token=os.getenv("SLACK_BOT_TOKEN", ""),
-        slack_channel_id=os.getenv("SLACK_CHANNEL_ID", ""),
-        slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL", ""),
+        slack_bot_token=os.getenv("SLACK_BOT_TOKEN", "").strip(),
+        slack_channel_id=os.getenv("SLACK_CHANNEL_ID", "").strip(),
+        slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL", "").strip(),
     )
 
 
@@ -2419,8 +2428,9 @@ def write_pdf_report(
     story.append(Spacer(1, 8))
     story.append(Paragraph("Editorial and Opinion Summary", title_style))
     story.append(Paragraph(html.escape(formatted_date, quote=False), centered_date_style))
-    story.append(Spacer(1, 10))
+    story.append(Spacer(1, 5))
     story.append(Paragraph("Note: Clicking on an editorial title will redirect you to the original article.", header_note_style))
+    story.append(Spacer(1, 5))
 
     editorial_index = 1
     for source_name, source_editorials in grouped_editorials:
@@ -2509,14 +2519,22 @@ def post_to_slack(
 
     if config.slack_bot_token and config.slack_channel_id:
         client = WebClient(token=config.slack_bot_token)
-        client.files_upload_v2(
-            channel=config.slack_channel_id,
-            file=str(pdf_path),
-            filename=pdf_path.name,
-            title=f"Editorial and Opinion Summary {target_date}",
-            initial_comment=f"Editorial and Opinion Summary ({target_date})",
-        )
-        logging.info("Posted PDF file to Slack channel.")
+        try:
+            client.files_upload_v2(
+                channel=config.slack_channel_id,
+                file=str(pdf_path),
+                filename=pdf_path.name,
+                title=f"Editorial and Opinion Summary {target_date}",
+                initial_comment=f"Editorial and Opinion Summary ({target_date})",
+            )
+            logging.info("Posted PDF file to Slack channel.")
+        except SlackApiError as exc:
+            error_code = exc.response.get("error", "unknown_error")
+            logging.warning(
+                "Slack upload failed (%s). Check that SLACK_CHANNEL_ID contains only the channel ID "
+                "and that the bot has access to the target channel.",
+                error_code,
+            )
         return
 
     if config.slack_webhook_url:

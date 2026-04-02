@@ -5,6 +5,7 @@ This pipeline does the following:
   - `https://www.thehindu.com/opinion/editorial/`
   - `https://www.thehindu.com/opinion/op-ed/`
   - `https://www.thehindu.com/opinion/lead/`
+  - `https://www.thehindu.com/data/`
   - `https://www.thehindu.com/opinion/`
 - Extracts editorial article text and summarizes each editorial with Gemini 2.5 Flash
 - Builds daily editorial JSON + PDF report

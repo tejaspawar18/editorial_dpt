@@ -8,13 +8,13 @@ import re
 import time
 import unicodedata
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
-
 import boto3
 import requests
+import dateutil
 from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
 from dateutil import tz as date_tz
@@ -33,7 +33,8 @@ DEFAULT_HINDU_EDITORIAL_URL = "https://www.thehindu.com/opinion/lead/"
 DEFAULT_HINDU_EDITORIAL_URLS = [
     "https://www.thehindu.com/opinion/lead/",
     "https://www.thehindu.com/opinion/editorial/",
-    "https://www.thehindu.com/opinion/op-ed/"
+    "https://www.thehindu.com/opinion/op-ed/",
+    "https://www.thehindu.com/data/"
 ]
 DEFAULT_INDIAN_EXPRESS_EDITORIAL_URLS = [
     "https://indianexpress.com/section/opinion/editorials/?ref=l1_section",
@@ -66,6 +67,8 @@ DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 DEFAULT_S3_PREFIX = "hindu-editorials"
 GEMINI_API_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 REQUEST_TIMEOUT_SECONDS = 30
+INDIAN_EXPRESS_SECTION_MAX_PAGES = 10
+DATE_WINDOW_CUTOFF_HOUR = 9
 DEFAULT_SLACK_UPLOAD_MAX_RETRIES = 4
 DEFAULT_SLACK_RETRY_BACKOFF_SECONDS = 5
 DEFAULT_SLACK_FALLBACK_LINK_EXPIRY_SECONDS = 7 * 24 * 60 * 60
@@ -1154,6 +1157,71 @@ def format_header_date(target_date: str) -> str:
     return parsed.strftime("%d-%m-%Y")
 
 
+def build_editorial_window(target_date: str, timezone_name: str) -> tuple[datetime, datetime]:
+    tz_info = get_tzinfo(timezone_name)
+    target_day = datetime.strptime(target_date, "%Y-%m-%d").date()
+    window_end = datetime.combine(target_day, dt_time(hour=DATE_WINDOW_CUTOFF_HOUR), tzinfo=tz_info)
+    window_start = window_end - timedelta(days=1)
+    return window_start, window_end
+
+
+def previous_calendar_date(target_date: str) -> str:
+    target_day = datetime.strptime(target_date, "%Y-%m-%d").date()
+    return (target_day - timedelta(days=1)).isoformat()
+
+
+def infer_editorial_datetime(editorial: Editorial, timezone_name: str) -> datetime | None:
+    parsed_dt = parse_datetime(editorial.published_at, timezone_name)
+    if parsed_dt:
+        return parsed_dt
+
+    if not editorial.editorial_date:
+        return None
+
+    try:
+        parsed_date = datetime.strptime(editorial.editorial_date, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+    # When only the calendar date is available, place the article in the middle
+    # of the day so date-window checks can still include likely matches.
+    return datetime.combine(parsed_date, dt_time(hour=12), tzinfo=get_tzinfo(timezone_name))
+
+
+def is_editorial_in_window(editorial: Editorial, target_date: str, timezone_name: str) -> bool:
+    editorial_dt = infer_editorial_datetime(editorial, timezone_name)
+    if not editorial_dt:
+        return False
+    window_start, window_end = build_editorial_window(target_date, timezone_name)
+    return window_start <= editorial_dt < window_end
+
+
+def load_sent_article_urls(output_root: Path, target_date: str) -> set[str]:
+    previous_date = previous_calendar_date(target_date)
+    payload_path = output_root / previous_date / "editorials.json"
+    if not payload_path.exists():
+        return set()
+
+    try:
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logging.warning("Failed to read previous editorial payload %s: %s", payload_path, exc)
+        return set()
+
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return set()
+
+    urls: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        normalized = normalize_editorial_url(str(item.get("url", "")).strip())
+        if normalized:
+            urls.add(normalized)
+    return urls
+
+
 def source_name_from_url(url: str) -> str:
     host = (urlparse(url).netloc or "").lower()
     if host.endswith("thehindu.com"):
@@ -1828,34 +1896,60 @@ def authenticate_indian_express(session: requests.Session, config: PipelineConfi
     return False
 
 
+def build_paginated_section_urls(editorial_url: str) -> list[str]:
+    urls = [editorial_url]
+    parsed = urlparse(editorial_url)
+    host = (parsed.netloc or "").lower()
+    normalized_path = re.sub(r"/{2,}", "/", parsed.path or "/")
+    if not host.endswith("indianexpress.com") or not normalized_path.startswith("/section/"):
+        return urls
+
+    clean_path = normalized_path.rstrip("/") or "/"
+    for page_number in range(2, INDIAN_EXPRESS_SECTION_MAX_PAGES + 1):
+        paginated_path = f"{clean_path}/page/{page_number}/"
+        paginated_url = parsed._replace(path=paginated_path).geturl()
+        urls.append(paginated_url)
+    return dedupe_preserve_order(urls)
+
+
 def fetch_editorial_links(session: requests.Session, editorial_urls: list[str]) -> list[str]:
     links: set[str] = set()
     for editorial_url in editorial_urls:
-        try:
-            response = session.get(
-                editorial_url,
-                headers={"User-Agent": "Mozilla/5.0 (EditorialPipeline/1.0)"},
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
-            response.raise_for_status()
-            soup = BeautifulSoup(decode_response_text(response), "html.parser")
+        empty_page_streak = 0
+        for candidate_url in build_paginated_section_urls(editorial_url):
+            try:
+                response = session.get(
+                    candidate_url,
+                    headers={"User-Agent": "Mozilla/5.0 (EditorialPipeline/1.0)"},
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                soup = BeautifulSoup(decode_response_text(response), "html.parser")
 
-            before_count = len(links)
-            for anchor in soup.select("a[href]"):
-                href = anchor.get("href")
-                if not href:
-                    continue
-                absolute = urljoin(editorial_url, href)
-                normalized = normalize_editorial_url(absolute)
-                if normalized:
-                    links.add(normalized)
-            logging.info(
-                "Collected %d opinion article link(s) from %s.",
-                len(links) - before_count,
-                editorial_url,
-            )
-        except Exception as exc:
-            logging.warning("Failed to collect links from %s: %s", editorial_url, exc)
+                before_count = len(links)
+                for anchor in soup.select("a[href]"):
+                    href = anchor.get("href")
+                    if not href:
+                        continue
+                    absolute = urljoin(candidate_url, href)
+                    normalized = normalize_editorial_url(absolute)
+                    if normalized:
+                        links.add(normalized)
+                collected_count = len(links) - before_count
+                logging.info(
+                    "Collected %d opinion article link(s) from %s.",
+                    collected_count,
+                    candidate_url,
+                )
+                if collected_count == 0:
+                    empty_page_streak += 1
+                    if empty_page_streak >= 2:
+                        break
+                else:
+                    empty_page_streak = 0
+            except Exception as exc:
+                logging.warning("Failed to collect links from %s: %s", candidate_url, exc)
+                break
     return sorted(links)
 
 
@@ -2713,6 +2807,8 @@ def post_to_slack(
 def run_pipeline(config: PipelineConfig) -> None:
     output_dir = Path(config.output_dir).resolve() / config.target_date
     output_dir.mkdir(parents=True, exist_ok=True)
+    window_start, window_end = build_editorial_window(config.target_date, config.timezone)
+    previously_sent_urls = load_sent_article_urls(Path(config.output_dir).resolve(), config.target_date)
 
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0 (EditorialPipeline/1.0)"})
@@ -2736,6 +2832,16 @@ def run_pipeline(config: PipelineConfig) -> None:
         len(links),
         len(config.editorial_urls),
     )
+    logging.info(
+        "Filtering opinion articles within %s <= published_at < %s",
+        window_start.isoformat(),
+        window_end.isoformat(),
+    )
+    logging.info(
+        "Loaded %d previously sent article URL(s) from %s for duplicate suppression.",
+        len(previously_sent_urls),
+        previous_calendar_date(config.target_date),
+    )
 
     editorials: list[Editorial] = []
     seen_urls: set[str] = set()
@@ -2757,7 +2863,10 @@ def run_pipeline(config: PipelineConfig) -> None:
             continue
         if editorial.url in seen_urls:
             continue
-        if editorial.editorial_date != config.target_date:
+        if editorial.url in previously_sent_urls:
+            logging.info("Skipping article already sent in previous day's Slack payload: %s", editorial.url)
+            continue
+        if not is_editorial_in_window(editorial, config.target_date, config.timezone):
             continue
         seen_urls.add(editorial.url)
         editorials.append(editorial)
@@ -2808,4 +2917,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
